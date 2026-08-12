@@ -1,0 +1,12 @@
+# 生成物 (由 prepare.sh / build.sh 可重现)
+build/
+dist/
+fluffychat-web-*.tar.gz
+
+# 本地编译的二进制
+fluffychat-portable
+*.exe
+
+# 日志/杂项
+*.log
+.DS_Store

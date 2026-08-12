@@ -1,0 +1,43 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  build-and-smoke:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - name: Install Pillow (托盘图标生成)
+        run: pip install pillow
+
+      - name: Prepare web assets (可重现构建验证)
+        run: ./prepare.sh
+
+      - name: go vet
+        run: go vet ./...
+
+      - name: Build all targets
+        run: ./build.sh
+
+      - name: Smoke test
+        run: |
+          ./dist/fluffychat-portable-linux-x64 -no-open -port 0 > /tmp/pfc.log 2>&1 &
+          for i in $(seq 1 10); do grep -q '已启动' /tmp/pfc.log && break; sleep 1; done
+          PORT=$(grep -oP '127\.0\.0\.1:\d+' /tmp/pfc.log | head -1)
+          echo "server at: $PORT"
+          curl -sf "$PORT/health" | grep -q fluffychat-portable && echo "health OK"
+          curl -sf -o /dev/null "$PORT/main.dart.js" && echo "main.dart.js OK"
+          curl -sf -o /dev/null "$PORT/canvaskit/chromium/canvaskit.wasm" && echo "canvaskit OK"
+          curl -sf "$PORT/config.json" | grep -q defaultHomeserver && echo "config.json OK"
+          PORTNUM=${PORT##*:}
+          ./dist/fluffychat-portable-linux-x64 -stop -port "$PORTNUM"
+          sleep 1
+          curl -sf -m 1 "$PORT/health" > /dev/null 2>&1 && { echo "FAIL: 仍在线"; exit 1; } || echo "shutdown OK"
