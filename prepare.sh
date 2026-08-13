@@ -35,6 +35,19 @@ img.save('favicon.ico', sizes=[(16,16),(32,32),(48,48),(64,64)])
 print('favicon.ico generated')
 PY
 
+# Tauri 图标: 生成 src-tauri/icons/ (窗口/托盘/打包图标)
+mkdir -p ../../src-tauri/icons
+python3 - <<'PY' || true
+from PIL import Image
+src = Image.open('icons/Icon-192.png').convert('RGBA')
+src.resize((512, 512), Image.LANCZOS).save('../../src-tauri/icons/icon.png')
+src.resize((32, 32), Image.LANCZOS).save('../../src-tauri/icons/32x32.png')
+src.resize((128, 128), Image.LANCZOS).save('../../src-tauri/icons/128x128.png')
+src.resize((256, 256), Image.LANCZOS).save('../../src-tauri/icons/128x128@2x.png')
+src.save('../../src-tauri/icons/icon.ico', sizes=[(16,16),(24,24),(32,32),(48,48),(64,64),(128,128),(256,256)])
+print('tauri icons generated')
+PY
+
 echo "[4/4] 改写 index.html (base href / canvaskit 本地化 / 禁用 SW)..."
 python3 - <<'PY'
 import re

@@ -1,7 +1,11 @@
-# 生成物 (由 prepare.sh / build.sh 可重现)
+# 生成物 (由 prepare.sh 可重现)
 build/
 dist/
 fluffychat-web-*.tar.gz
+
+# Rust 构建产物
+src-tauri/target/
+src-tauri/gen/
 
 # 本地编译的二进制
 fluffychat-portable

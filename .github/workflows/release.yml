@@ -1,6 +1,6 @@
 name: Build & Release
 
-# 手动触发: 输入 FluffyChat 版本号, 构建全平台单二进制并发布到 GitHub Releases
+# 手动触发: 输入 FluffyChat 版本号, 构建 Windows 单 exe + 安装器 并发布到 GitHub Releases
 # 用法: Actions 页面 → Run workflow → 填 FluffyChat 版本 (默认 v2.8.0)
 on:
   workflow_dispatch:
@@ -10,80 +10,89 @@ on:
         required: true
         default: 'v2.8.0'
       tag:
-        description: '自定义 Git tag (默认 portable-<version>)'
+        description: '自定义 Git tag (默认 tauri-<version>)'
         required: false
         default: ''
 
 jobs:
-  build:
+  prepare:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Pillow (图标生成)
+        run: pip install pillow
+      - name: Prepare web assets
+        run: ./prepare.sh ${{ inputs.version }}
+      - uses: actions/upload-artifact@v4
+        with:
+          name: web-assets
+          path: |
+            build/web_offline
+            src-tauri/icons
+
+  build-windows:
+    needs: prepare
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: web-assets
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc
+      - name: Build portable exe (单文件)
+        run: |
+          cd src-tauri
+          cargo build --release --target x86_64-pc-windows-msvc
+      - name: Install tauri-cli
+        run: cargo install tauri-cli --locked
+      - name: Bundle NSIS + MSI installers
+        run: |
+          cd src-tauri
+          cargo tauri build --bundles nsis,msi
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: fluffychat-portable-windows
+          path: |
+            src-tauri/target/x86_64-pc-windows-msvc/release/fluffychat-portable.exe
+            src-tauri/target/x86_64-pc-windows-msvc/release/bundle/nsis/*.exe
+            src-tauri/target/x86_64-pc-windows-msvc/release/bundle/msi/*.msi
+
+  release:
+    needs: build-windows
     runs-on: ubuntu-latest
     permissions:
       contents: write
     steps:
       - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
         with:
-          fetch-depth: 0
-          fetch-tags: true
-
-      - uses: actions/setup-go@v5
-        with:
-          go-version-file: go.mod
-
-      - name: Install Pillow (托盘图标生成)
-        run: pip install pillow
-
-      - name: Prepare web assets
-        run: ./prepare.sh ${{ inputs.version }}
-
-      - name: Build all targets
-        run: ./build.sh
-
-      - name: Smoke test
-        run: |
-          ./dist/fluffychat-portable-linux-x64 -no-open -port 0 > /tmp/pfc.log 2>&1 &
-          for i in $(seq 1 10); do grep -q '已启动' /tmp/pfc.log && break; sleep 1; done
-          PORT=$(grep -oP '127\.0\.0\.1:\d+' /tmp/pfc.log | head -1)
-          curl -sf "$PORT/health" | grep -q fluffychat-portable && echo "health OK"
-          curl -sf -o /dev/null "$PORT/canvaskit/chromium/canvaskit.wasm" && echo "canvaskit OK"
-          PORTNUM=${PORT##*:}
-          ./dist/fluffychat-portable-linux-x64 -stop -port "$PORTNUM"
-          echo "SMOKE OK"
-
-      - name: Upload artifacts
-        uses: actions/upload-artifact@v4
-        with:
-          name: fluffychat-portable-${{ inputs.version }}
-          path: dist/
-
-      - name: Clean existing release (可重跑同版本)
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          TAG="${{ inputs.tag || format('portable-{0}', inputs.version) }}"
-          gh release delete "$TAG" --yes --repo "${{ github.repository }}" || true
-          git push origin ":refs/tags/$TAG" 2>/dev/null || true
-
-      - name: Create GitHub Release
+          name: fluffychat-portable-windows
+          path: dist
+      - name: Publish GitHub Release
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: ${{ inputs.tag || format('portable-{0}', inputs.version) }}
-          name: FluffyChat Portable ${{ inputs.version }}
-          files: dist/*
+          tag_name: ${{ inputs.tag || format('tauri-{0}', inputs.version) }}
+          name: FluffyChat Portable (Tauri) ${{ inputs.version }}
+          files: dist/**
           body: |
-            FluffyChat Web **${{ inputs.version }}** 的离线单二进制封装。
+            FluffyChat Web **${{ inputs.version }}** 的离线单二进制桌面封装 (Tauri 版)。
 
             ## 文件
-            - `fluffychat-portable-win64-gui-v*.exe` — Windows x64, 托盘常驻 (推荐)
-            - `fluffychat-portable-win64-v*.exe` — Windows x64, 控制台版
-            - `fluffychat-portable-win32-v*.exe` — Windows x86 (win32)
-            - `fluffychat-portable-linux-x64` — Linux x64
+            - `fluffychat-portable.exe` — 便携单文件 (推荐, 双击即用, 无安装)
+            - `FluffyChat Portable_*_x64-setup.exe` — NSIS 安装器
+            - `FluffyChat Portable_*_x64_zh-CN.msi` — MSI 安装器
 
             ## 用法
-            双击 exe 即起本地服务 (127.0.0.1:8800) 并打开浏览器; 预设服务器:
-            `fluffychat-portable.exe -homeserver <你的服务器>`
-            退出: 托盘图标 → 退出 (或 `-stop`)。
+            双击运行即弹桌面窗口; 关闭窗口隐藏到系统托盘, 托盘右键退出。
+            预设服务器: `fluffychat-portable.exe -homeserver <你的服务器>`
+
+            ## 依赖
+            Windows 10/11 普遍内置 WebView2; 极老/精简系统需先装 Microsoft Edge WebView2 Runtime。
 
             ## 合规
             - 打包的 FluffyChat (AGPL-3.0): 上游 https://github.com/krille-chan/fluffychat (tag `${{ inputs.version }}`)
-            - 对应源码与可重现构建: 本仓库 `prepare.sh` + `build.sh` (本 Release 即由 CI 构建)
+            - 对应源码与可重现构建: 本仓库 `prepare.sh` + `src-tauri/` (本 Release 即由 CI 构建)
             - 详见 THIRD_PARTY_NOTICES.md
