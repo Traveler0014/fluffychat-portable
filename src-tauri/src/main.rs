@@ -14,13 +14,15 @@
 //   关闭窗口 = 隐藏到托盘 (常驻); 托盘图标 → 右键 → 退出
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::OnceLock;
 
 use rust_embed::RustEmbed;
 use tauri::http::{header, Request, Response, StatusCode};
 use tauri::menu::{Menu, MenuItem};
 use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
-use tauri::{Manager, WindowEvent};
+use tauri::webview::NewWindowResponse;
+use tauri::{Manager, WebviewUrl, WebviewWindowBuilder, WindowEvent};
 
 /// 裁剪后的 FluffyChat Web 静态资源 (由 prepare.sh 生成到 build/web_offline/)
 /// 注意: 相对路径基于 $CARGO_MANIFEST_DIR = src-tauri/
@@ -30,6 +32,9 @@ struct WebAssets;
 
 /// 运行时生成的 config.json 内容 (等价 Go 版 renderConfig)
 static CONFIG_JSON: OnceLock<String> = OnceLock::new();
+
+/// 用于给 SSO popup 窗口生成唯一 label
+static NEXT_WINDOW_ID: AtomicU64 = AtomicU64::new(1);
 
 fn main() {
     let (homeserver, preset) = parse_args();
@@ -47,6 +52,7 @@ fn main() {
         }))
         .register_uri_scheme_protocol("fc", |_ctx, req| handle_protocol(req))
         .setup(|app| {
+            setup_main_window(app)?;
             setup_tray(app)?;
             Ok(())
         })
@@ -212,6 +218,43 @@ fn mime_type(path: &str) -> &'static str {
         "bin" => "application/octet-stream",
         _ => "application/octet-stream",
     }
+}
+
+/// 创建主窗口 (含 window.open 的 SSO popup 处理)
+fn setup_main_window(app: &tauri::App) -> tauri::Result<()> {
+    let handle = app.handle().clone();
+    let url: tauri::Url = "fc://localhost/".parse().expect("valid fc url");
+
+    WebviewWindowBuilder::new(app, "main", WebviewUrl::External(url))
+        .title("FluffyChat")
+        .inner_size(480.0, 820.0)
+        .min_inner_size(360.0, 600.0)
+        .center()
+        .on_new_window(move |_url, features| {
+            // FluffyChat 的 SSO 登录 (flutter_web_auth_2) 用 window.open 打开鉴权弹窗;
+            // Tauri 默认 Deny window.open, 导致"无浏览器拉起、持续转圈"。这里创建真正的
+            // 子窗口: WebView2 的 SetNewWindow 会自动建立 window.opener 关系并导航到 url,
+            // 鉴权完成后 auth.html 经 postMessage 回传 loginToken。
+            let label = format!(
+                "sso-popup-{}",
+                NEXT_WINDOW_ID.fetch_add(1, Ordering::Relaxed)
+            );
+            let builder = WebviewWindowBuilder::new(
+                &handle,
+                &label,
+                WebviewUrl::External("about:blank".parse().unwrap()),
+            )
+            .inner_size(480.0, 640.0)
+            .window_features(features)
+            .title("登录");
+
+            match builder.build() {
+                Ok(window) => NewWindowResponse::Create { window },
+                Err(_) => NewWindowResponse::Deny,
+            }
+        })
+        .build()?;
+    Ok(())
 }
 
 /// 系统托盘: 左键唤醒窗口, 右键菜单 (显示/退出)

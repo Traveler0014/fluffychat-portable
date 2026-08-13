@@ -48,6 +48,9 @@ fluffychat-portable.exe -preset "server1.example,server2.example"
   3. 移除 Flutter 自带 Service Worker
 - **动态 config.json**：协议处理器对 `/config.json` 返回运行时生成的配置（等价 Go 版
   `-homeserver` / `-preset` 参数），其余路径从嵌入资源读取（含正确 MIME，`wasm` → `application/wasm`）。
+- **SSO 登录 (OIDC / legacy SSO)**：FluffyChat 的 SSO 用 `window.open` 开鉴权弹窗（Tauri 默认拦截）。
+  本版通过 `on_new_window` 创建真正的子窗口——WebView2 `SetNewWindow` 自动建立 `window.opener`
+  关系并导航到鉴权页，完成后 `auth.html` 经 `postMessage` 回传 loginToken，支持 Mozilla 等 SSO 服务器。
 - **系统托盘**：关闭窗口隐藏到托盘；左键唤回，右键菜单「打开 / 退出」。
 - **单实例**：`tauri-plugin-single-instance`，二次启动唤醒已有窗口。
 - **离线验证**（main 分支已用 Playwright 拦截外部请求实测）：Flutter app 完整启动
