@@ -353,8 +353,11 @@ fn host_of(url: &tauri::Url) -> Option<String> {
 /// 1. 保存到系统"下载"目录, 同名文件自动追加序号 (photo.png → photo (1).png)
 /// 2. 下载完成后在文件管理器中定位该文件, 作为明确的完成反馈
 ///
-/// 注: FluffyChat Web 保存文件 = 取回字节 → blob URL → `<a download>` 点击,
+/// 注 1: FluffyChat Web 保存文件 = 取回字节 → blob URL → `<a download>` 点击,
 /// 各 WebView 均将此作为标准下载事件处理, 建议文件名即 download 属性值。
+/// 注 2: 不弹"另存为"对话框: on_download 在主线程同步回调, 必须当场给出
+/// 允许/拒绝 (tauri-plugin-dialog 的 blocking API 明确禁止主线程使用, 会死锁;
+/// blob URL 也无法由 Rust 侧接手重新下载), 因此固定保存到下载目录。
 fn make_download_handler(
 ) -> impl Fn(tauri::Webview<tauri::Wry>, DownloadEvent<'_>) -> bool + Send + Sync + 'static {
     |webview, event| match event {
@@ -432,11 +435,20 @@ fn file_name_from_url(url: &tauri::Url) -> String {
 
 /// 在系统文件管理器中定位并显示文件 (下载完成的可见反馈)
 fn reveal_in_file_manager(path: &Path) {
+    // Windows: 必须用 raw_arg 手工拼 `explorer /select,"路径"`。普通 .arg() 会按 CRT 规则
+    // 给含空格的参数整体加引号 —— 重名自动加序号的 "photo (1).png" 必含空格 —— explorer
+    // 解析不了 "/select,C:\a b.png", 会退回打开默认文件夹 (如 Documents) 而非下载目录。
     #[cfg(target_os = "windows")]
     {
-        let _ = std::process::Command::new("explorer")
-            .arg(format!("/select,{}", path.as_os_str().to_string_lossy()))
-            .spawn();
+        use std::os::windows::process::CommandExt;
+        if path.is_file() {
+            let _ = std::process::Command::new("explorer.exe")
+                .raw_arg(format!("/select,\"{}\"", path.display()))
+                .spawn();
+        } else if let Some(dir) = path.parent().filter(|d| d.is_dir()) {
+            // 防御: 文件已不在 (极端情况) 时至少打开其所在目录
+            let _ = std::process::Command::new("explorer.exe").arg(dir).spawn();
+        }
     }
     #[cfg(target_os = "linux")]
     {
