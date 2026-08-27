@@ -35,6 +35,23 @@ jobs:
       - name: Prepare web assets
         run: ./prepare.sh ${{ inputs.version }}
 
+      - name: Verify upstream version
+        # 校验实际下载的 web 包版本与请求一致 (防镜像错误/陈旧产物)。
+        # 二进制命名由 build.sh 从 version.json 动态读取, 无元数据硬编码;
+        # 但若镜像给错包, Release tag/body 与产物版本会不一致 → 这里拦下。
+        env:
+          VERSION: ${{ inputs.version }}
+        run: |
+          set -euo pipefail
+          [[ "$VERSION" =~ ^v[0-9]+(\.[0-9]+)*(\+[0-9]+)?$ ]] \
+            || { echo "::error::非法版本号: $VERSION"; exit 1; }
+          VER="${VERSION#v}"; VER="${VER%%+*}"
+          ACTUAL=$(jq -r '.version' build/web_offline/version.json)
+          BUILD_NO=$(jq -r '.build_number' build/web_offline/version.json)
+          [ "$ACTUAL" = "$VER" ] \
+            || { echo "::error::版本不匹配: 请求 $VER, 但 web 包实际为 $ACTUAL"; exit 1; }
+          echo "上游 web 包版本校验通过: $ACTUAL (build $BUILD_NO)"
+
       - name: Build all targets
         run: ./build.sh
 
