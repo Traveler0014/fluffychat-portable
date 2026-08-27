@@ -64,7 +64,19 @@ jobs:
       - name: Bundle NSIS + MSI installers
         run: |
           cd src-tauri
-          cargo tauri build --bundles nsis,msi
+          cargo tauri build --bundles nsis,msi --target x86_64-pc-windows-msvc
+      - name: Verify bundle outputs (防止安装器静默丢失)
+        # 此前 tauri build 未带 --target, 安装器落在 target/release/bundle/ 而
+        # upload-artifact 只扫 target/<triple>/release/bundle/ → glob 匹配不到,
+        # upload-artifact 仅 warning 不报错 → Release 只剩 exe。这里显式校验。
+        shell: bash
+        run: |
+          BUNDLE=src-tauri/target/x86_64-pc-windows-msvc/release/bundle
+          compgen -G "$BUNDLE/nsis/*-setup.exe" > /dev/null \
+            || { echo "::error::NSIS installer missing under $BUNDLE/nsis/"; ls -R "$BUNDLE" || true; exit 1; }
+          compgen -G "$BUNDLE/msi/*.msi" > /dev/null \
+            || { echo "::error::MSI installer missing under $BUNDLE/msi/"; ls -R "$BUNDLE" || true; exit 1; }
+          ls -la "$BUNDLE/nsis" "$BUNDLE/msi"
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
         with:
@@ -97,7 +109,7 @@ jobs:
             ## 文件
             - `fluffychat-portable.exe` — 便携单文件 (推荐, 双击即用, 无安装)
             - `FluffyChat Portable_*_x64-setup.exe` — NSIS 安装器
-            - `FluffyChat Portable_*_x64_zh-CN.msi` — MSI 安装器
+            - `FluffyChat Portable_*_x64_*.msi` — MSI 安装器
 
             ## 用法
             双击运行即弹桌面窗口; 关闭窗口隐藏到系统托盘, 托盘右键退出。
