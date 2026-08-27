@@ -109,7 +109,9 @@ IndexedDB / localStorage（无独立文件），落在 WebView **用户数据目
 ## CI / 自动跟随上游发布
 
 - `ci.yml`：push/PR 验证可重现构建（prepare.sh + 双平台编译）
-- `release.yml`：手动触发（输入上游版本号）→ 构建 + 发布 Release；同时作为可复用工作流被调用
+- `release.yml`：手动触发（输入上游版本号）→ 构建 + 发布 Release；同时作为可复用工作流被调用。
+  构建时会校验下载的 web 包版本与请求一致（防陈旧产物），并把 `tauri.conf.json`/`Cargo.toml`
+  的版本同步为上游版本（否则安装器命名/exe 属性停留在仓库基线版本号）
 - `auto-upstream.yml`：每 6 小时轮询 FluffyChat 上游 releases，发现新版本（正式 release 且带
   `fluffychat-web.tar.gz` 资产）且本仓库尚无对应 `tauri-<版本>` Release 时，自动调用
   `release.yml` 构建发布

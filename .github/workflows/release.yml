@@ -37,12 +37,38 @@ jobs:
         run: pip install pillow
       - name: Prepare web assets
         run: ./prepare.sh ${{ inputs.version }}
+      - name: Verify upstream version & sync build metadata
+        # 1) 校验实际下载的上游 web 包版本 (防镜像错误/陈旧产物)
+        # 2) 同步 tauri.conf.json / Cargo.toml 版本 —— 两者在仓库里是写死的基线版本,
+        #    不回写会导致 NSIS/MSI 文件名与 exe 属性停留在旧版本号 (如 v2.9.1 构建出 2.8.0 安装器)
+        env:
+          VERSION: ${{ inputs.version }}
+        run: |
+          set -euo pipefail
+          # 版本号格式校验 (与 auto-upstream.yml 一致)
+          [[ "$VERSION" =~ ^v[0-9]+(\.[0-9]+)*(\+[0-9]+)?$ ]] \
+            || { echo "::error::非法版本号: $VERSION"; exit 1; }
+          VER="${VERSION#v}"      # 去 v 前缀
+          VER="${VER%%+*}"        # 去 +build 元数据 (不进安装器命名)
+
+          ACTUAL=$(jq -r '.version' build/web_offline/version.json)
+          BUILD_NO=$(jq -r '.build_number' build/web_offline/version.json)
+          [ "$ACTUAL" = "$VER" ] \
+            || { echo "::error::版本不匹配: 请求 $VER, 但 web 包实际为 $ACTUAL"; exit 1; }
+          echo "上游 web 包版本校验通过: $ACTUAL (build $BUILD_NO)"
+
+          jq --arg v "$VER" '.version = $v' src-tauri/tauri.conf.json > src-tauri/.tauri.conf.tmp \
+            && mv src-tauri/.tauri.conf.tmp src-tauri/tauri.conf.json
+          sed -i "0,/^version = \".*\"/s//version = \"$VER\"/" src-tauri/Cargo.toml
+          echo "构建元数据版本已同步: $VER (安装器将命名为 *_${VER}_*)"
       - uses: actions/upload-artifact@v4
         with:
           name: web-assets
           path: |
             build/web_offline
             src-tauri/icons
+            src-tauri/tauri.conf.json
+            src-tauri/Cargo.toml
 
   build-windows:
     needs: prepare
@@ -108,8 +134,8 @@ jobs:
 
             ## 文件
             - `fluffychat-portable.exe` — 便携单文件 (推荐, 双击即用, 无安装)
-            - `FluffyChat Portable_*_x64-setup.exe` — NSIS 安装器
-            - `FluffyChat Portable_*_x64_*.msi` — MSI 安装器
+            - `FluffyChat.Portable_*_x64-setup.exe` — NSIS 安装器
+            - `FluffyChat.Portable_*_x64_*.msi` — MSI 安装器
 
             ## 用法
             双击运行即弹桌面窗口; 关闭窗口隐藏到系统托盘, 托盘右键退出。
