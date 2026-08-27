@@ -106,6 +106,19 @@ IndexedDB / localStorage（无独立文件），落在 WebView **用户数据目
   FluffyChat 设置中导出加密备份
 - 换机器：同上，走加密备份恢复
 
+## CI / 自动跟随上游发布
+
+- `ci.yml`：push/PR 验证可重现构建（prepare.sh + 双平台编译）
+- `release.yml`：手动触发（输入上游版本号）→ 构建 + 发布 Release；同时作为可复用工作流被调用
+- `auto-upstream.yml`：每 6 小时轮询 FluffyChat 上游 releases，发现新版本（正式 release 且带
+  `fluffychat-web.tar.gz` 资产）且本仓库尚无对应 `tauri-<版本>` Release 时，自动调用
+  `release.yml` 构建发布
+
+> ⚠️ GitHub 的 `schedule` 触发只在**默认分支**生效；本仓库默认分支为 `main`（Go 版），
+> 将 `tauri` 分支合入 `main`（或把默认分支切到 `tauri`）后自动跟随才会定时运行。
+> 上游构建布局变化导致 `prepare.sh` 失败时自动构建会持续报错，需手动修复脚本
+>（期间可先在 Settings → Actions 中禁用该工作流，修好后可手动触发重出包）。
+
 ## 注意事项
 
 - **Matrix 通信仍需联网**：本方案只解决"界面加载慢"；消息收发走你所选的 homeserver。

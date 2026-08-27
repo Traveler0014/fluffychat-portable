@@ -2,6 +2,7 @@ name: Build & Release
 
 # 手动触发: 输入 FluffyChat 版本号, 构建 Windows 单 exe + 安装器 并发布到 GitHub Releases
 # 用法: Actions 页面 → Run workflow → 填 FluffyChat 版本 (默认 v2.8.0)
+# 也可被 auto-upstream.yml (上游发布自动跟随) 以 reusable workflow 方式调用
 on:
   workflow_dispatch:
     inputs:
@@ -9,10 +10,23 @@ on:
         description: 'FluffyChat 上游版本 (如 v2.8.0)'
         required: true
         default: 'v2.8.0'
+        type: string
       tag:
         description: '自定义 Git tag (默认 tauri-<version>)'
         required: false
         default: ''
+        type: string
+  workflow_call:
+    inputs:
+      version:
+        description: 'FluffyChat 上游版本 (如 v2.8.0)'
+        required: true
+        type: string
+      tag:
+        description: '自定义 Git tag (默认 tauri-<version>)'
+        required: false
+        default: ''
+        type: string
 
 jobs:
   prepare:

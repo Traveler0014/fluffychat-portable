@@ -1,0 +1,82 @@
+name: Auto Follow Upstream
+
+# 自动跟随 FluffyChat 上游发布:
+#   每 6 小时轮询上游 GitHub releases, 发现新版本 (正式 release 且附带
+#   fluffychat-web.tar.gz 资产) 且本仓库尚未构建过 (不存在 tauri-<版本> tag)
+#   时, 自动调用 release.yml 构建并发布。
+#
+# 注意: GitHub 的 schedule 触发只在默认分支上生效 —— 本仓库默认分支为 main (Go 版),
+#       将 tauri 分支合入 main (或把默认分支切到 tauri) 后才会定时运行。
+#       上游页面结构变化导致 prepare.sh 失败时, 构建会一直失败, 需手动修复脚本
+#       (此时可先在仓库 Settings → Actions 中禁用本工作流)。
+#
+# 也可手动触发:
+#   - 留空 force_version: 仅检查一次是否有新版本
+#   - 填 force_version:   强制构建指定版本 (用于修复脚本后重出包)
+on:
+  schedule:
+    - cron: '17 */6 * * *' # 每天UTC 00:17/06:17/12:17/18:17 (避开整点高峰)
+  workflow_dispatch:
+    inputs:
+      force_version:
+        description: '强制构建的上游版本 (留空 = 仅检查)'
+        required: false
+        default: ''
+        type: string
+
+concurrency:
+  group: auto-follow-upstream
+  cancel-in-progress: false
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    outputs:
+      version: ${{ steps.check.outputs.version }}
+    steps:
+      - name: 检查上游新版本
+        id: check
+        env:
+          GH_TOKEN: ${{ github.token }}
+          FORCE_VERSION: ${{ inputs.force_version }}
+        run: |
+          set -euo pipefail
+          VERSION=""
+          if [ -n "${FORCE_VERSION:-}" ]; then
+            VERSION="${FORCE_VERSION}"
+          else
+            # 最新一个 (非 prerelease/draft 且附带 fluffychat-web.tar.gz 资产) 的上游 release;
+            # 跳过没有 web 资产的 release (如仅 APK 的 hotfix)
+            VERSION=$(curl -fsSL \
+              "https://api.github.com/repos/krille-chan/fluffychat/releases?per_page=30" \
+              | jq -r '[.[] | select(.draft == false and .prerelease == false)
+                        | select(any(.assets[]; .name == "fluffychat-web.tar.gz"))
+                        | .tag_name] | first // empty')
+          fi
+
+          # 严格校验版本号格式 (如 v2.8.0 / v2.8.0+3558), 防止注入到后续 shell/tag
+          if [ -z "$VERSION" ] || ! [[ "$VERSION" =~ ^v[0-9]+(\.[0-9]+)*(\+[0-9]+)?$ ]]; then
+            echo "未发现有效的上游新版本, 跳过"
+            exit 0
+          fi
+
+          # 已构建过 (tauri-<版本> tag 已存在) 则跳过
+          if gh api "repos/${GITHUB_REPOSITORY}/releases/tags/tauri-${VERSION}" >/dev/null 2>&1; then
+            echo "tauri-${VERSION} 已发布, 无需重复构建"
+            exit 0
+          fi
+
+          echo "检测到上游新版本: ${VERSION}, 触发自动构建"
+          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
+
+  release:
+    needs: check
+    if: needs.check.outputs.version != ''
+    permissions:
+      contents: write
+    uses: ./.github/workflows/release.yml
+    with:
+      version: ${{ needs.check.outputs.version }}
+    secrets: inherit
