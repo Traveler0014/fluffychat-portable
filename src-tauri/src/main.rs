@@ -14,6 +14,7 @@
 //   关闭窗口 = 隐藏到托盘 (常驻); 托盘图标 → 右键 → 退出
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::OnceLock;
 
@@ -21,7 +22,7 @@ use rust_embed::RustEmbed;
 use tauri::http::{header, Request, Response, StatusCode};
 use tauri::menu::{Menu, MenuItem};
 use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
-use tauri::webview::NewWindowResponse;
+use tauri::webview::{DownloadEvent, NewWindowResponse, NewWindowFeatures, PageLoadEvent};
 use tauri::{Manager, WebviewUrl, WebviewWindowBuilder, WindowEvent};
 
 /// 裁剪后的 FluffyChat Web 静态资源 (由 prepare.sh 生成到 build/web_offline/)
@@ -33,7 +34,7 @@ struct WebAssets;
 /// 运行时生成的 config.json 内容 (等价 Go 版 renderConfig)
 static CONFIG_JSON: OnceLock<String> = OnceLock::new();
 
-/// 用于给 SSO popup 窗口生成唯一 label
+/// 用于给 window.open 弹出的子窗口生成唯一 label
 static NEXT_WINDOW_ID: AtomicU64 = AtomicU64::new(1);
 
 fn main() {
@@ -220,7 +221,7 @@ fn mime_type(path: &str) -> &'static str {
     }
 }
 
-/// 创建主窗口 (含 window.open 的 SSO popup 处理)
+/// 创建主窗口 (含 window.open 弹窗处理与文件下载处理)
 fn setup_main_window(app: &tauri::App) -> tauri::Result<()> {
     let handle = app.handle().clone();
     let url: tauri::Url = "fc://localhost/".parse().expect("valid fc url");
@@ -230,31 +231,173 @@ fn setup_main_window(app: &tauri::App) -> tauri::Result<()> {
         .inner_size(480.0, 820.0)
         .min_inner_size(360.0, 600.0)
         .center()
-        .on_new_window(move |_url, features| {
-            // FluffyChat 的 SSO 登录 (flutter_web_auth_2) 用 window.open 打开鉴权弹窗;
-            // Tauri 默认 Deny window.open, 导致"无浏览器拉起、持续转圈"。这里创建真正的
-            // 子窗口: WebView2 的 SetNewWindow 会自动建立 window.opener 关系并导航到 url,
-            // 鉴权完成后 auth.html 经 postMessage 回传 loginToken。
-            let label = format!(
-                "sso-popup-{}",
-                NEXT_WINDOW_ID.fetch_add(1, Ordering::Relaxed)
-            );
-            let builder = WebviewWindowBuilder::new(
-                &handle,
-                &label,
-                WebviewUrl::External("about:blank".parse().unwrap()),
-            )
-            .inner_size(480.0, 640.0)
-            .window_features(features)
-            .title("登录");
-
-            match builder.build() {
-                Ok(window) => NewWindowResponse::Create { window },
-                Err(_) => NewWindowResponse::Deny,
-            }
-        })
+        .on_download(make_download_handler())
+        .on_new_window(move |url, features| open_web_popup(&handle, &url, features))
         .build()?;
     Ok(())
+}
+
+/// window.open 的通用子窗口: SSO/OIDC 登录、聊天中的外部链接、文件预览等,
+/// 不只是登录场景。Tauri 默认 Deny window.open, 这里创建真正的子窗口:
+/// WebView2 的 SetNewWindow 会自动建立 window.opener 关系并导航到目标 url
+/// (SSO 场景下 auth.html 完成后经 postMessage 回传 loginToken)。
+///
+/// 标题不写死: 初始显示目标站点域名, 页面加载后跟随 document.title (同浏览器),
+/// 用户始终能看出弹窗里是哪个站点 —— SSO 输入凭据时这也是防钓鱼的关键信息。
+fn open_web_popup(
+    handle: &tauri::AppHandle,
+    url: &tauri::Url,
+    features: NewWindowFeatures,
+) -> NewWindowResponse<tauri::Wry> {
+    let label = format!(
+        "web-popup-{}",
+        NEXT_WINDOW_ID.fetch_add(1, Ordering::Relaxed)
+    );
+    let initial_title = host_of(url).unwrap_or_else(|| "FluffyChat".into());
+
+    let builder = WebviewWindowBuilder::new(
+        handle,
+        &label,
+        WebviewUrl::External("about:blank".parse().unwrap()),
+    )
+    .inner_size(480.0, 640.0)
+    .window_features(features)
+    .title(&initial_title)
+    // 页面 document.title 变化 → 同步为窗口标题
+    .on_document_title_changed(|window, title| {
+        let _ = window.set_title(&title);
+    })
+    // 导航开始时先显示目标域名: 多跳转的 OIDC 流程中, 避免新页面加载完成前
+    // 窗口仍停留在上一跳的标题
+    .on_page_load(|window, payload| {
+        if matches!(payload.event(), PageLoadEvent::Started) {
+            if let Some(host) = host_of(payload.url()) {
+                let _ = window.set_title(&host);
+            }
+        }
+    })
+    // 弹窗里的网页同样可能触发下载 (如页面上的文件链接)
+    .on_download(make_download_handler());
+
+    match builder.build() {
+        Ok(window) => NewWindowResponse::Create { window },
+        Err(_) => NewWindowResponse::Deny,
+    }
+}
+
+fn host_of(url: &tauri::Url) -> Option<String> {
+    url.host_str()
+        .map(str::to_string)
+        .filter(|host| !host.is_empty())
+}
+
+/// 文件下载处理 (on_download), 主窗口与弹窗共用。
+///
+/// wry 的默认行为是"允许下载但完全静默": 无进度、无完成提示, 文件悄悄落在
+/// WebView 默认下载目录, 用户感知上就是"点了保存没反应"。这里统一改为:
+///
+/// 1. 保存到系统"下载"目录, 同名文件自动追加序号 (photo.png → photo (1).png)
+/// 2. 下载完成后在文件管理器中定位该文件, 作为明确的完成反馈
+///
+/// 注: FluffyChat Web 保存文件 = 取回字节 → blob URL → `<a download>` 点击,
+/// 各 WebView 均将此作为标准下载事件处理, 建议文件名即 download 属性值。
+fn make_download_handler(
+) -> impl Fn(tauri::Webview<tauri::Wry>, DownloadEvent<'_>) -> bool + Send + Sync + 'static {
+    |webview, event| match event {
+        DownloadEvent::Requested { url, destination } => {
+            let dir = webview
+                .path()
+                .download_dir()
+                .unwrap_or_else(|_| std::env::temp_dir());
+            let name = destination
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .filter(|n| !n.trim().is_empty())
+                .unwrap_or_else(|| file_name_from_url(&url));
+            *destination = unique_destination(&dir, &name);
+            // 返回 true = 允许下载
+            true
+        }
+        DownloadEvent::Finished { path, success, .. } => {
+            if success {
+                if let Some(path) = path {
+                    reveal_in_file_manager(&path);
+                }
+            }
+            true
+        }
+        _ => true,
+    }
+}
+
+/// 计算下载目标路径: 剥离建议文件名中的路径分隔符 (防逃逸下载目录),
+/// 已存在同名文件时追加序号 (对齐浏览器行为)。
+fn unique_destination(dir: &Path, raw_name: &str) -> PathBuf {
+    let name: String = raw_name
+        .chars()
+        .map(|c| match c {
+            '/' | '\\' | '\0' => '_',
+            _ => c,
+        })
+        .collect();
+    let name = name.trim();
+    if name.is_empty() {
+        return dir.join("download");
+    }
+
+    let path = dir.join(name);
+    if !path.exists() {
+        return path;
+    }
+
+    let stem = Path::new(name)
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or(name)
+        .to_string();
+    let ext = Path::new(name)
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(|e| format!(".{e}"))
+        .unwrap_or_default();
+
+    (1..=999)
+        .map(|i| dir.join(format!("{stem} ({i}){ext}")))
+        .find(|p| !p.exists())
+        .unwrap_or(path)
+}
+
+/// 兜底文件名: webview 未给出建议文件名时取 URL 最后一段
+fn file_name_from_url(url: &tauri::Url) -> String {
+    url.path_segments()
+        .and_then(|mut segs| segs.next_back())
+        .map(str::to_string)
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "download".into())
+}
+
+/// 在系统文件管理器中定位并显示文件 (下载完成的可见反馈)
+fn reveal_in_file_manager(path: &Path) {
+    #[cfg(target_os = "windows")]
+    {
+        let _ = std::process::Command::new("explorer")
+            .arg(format!("/select,{}", path.as_os_str().to_string_lossy()))
+            .spawn();
+    }
+    #[cfg(target_os = "linux")]
+    {
+        if let Some(dir) = path.parent() {
+            let _ = std::process::Command::new("xdg-open").arg(dir).spawn();
+        }
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let _ = std::process::Command::new("open").arg("-R").arg(path).spawn();
+    }
+    #[cfg(not(any(target_os = "windows", target_os = "linux", target_os = "macos")))]
+    {
+        let _ = path;
+    }
 }
 
 /// 系统托盘: 左键唤醒窗口, 右键菜单 (显示/退出)

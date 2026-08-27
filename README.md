@@ -51,6 +51,11 @@ fluffychat-portable.exe -preset "server1.example,server2.example"
 - **SSO 登录 (OIDC / legacy SSO)**：FluffyChat 的 SSO 用 `window.open` 开鉴权弹窗（Tauri 默认拦截）。
   本版通过 `on_new_window` 创建真正的子窗口——WebView2 `SetNewWindow` 自动建立 `window.opener`
   关系并导航到鉴权页，完成后 `auth.html` 经 `postMessage` 回传 loginToken，支持 Mozilla 等 SSO 服务器。
+  该弹窗是通用的（聊天外链、文件预览等同样走这里）：标题跟随页面真实 `document.title`
+  （导航中显示目标域名），不再写死为“登录”，SSO 输入凭据时也能看清当前站点，防钓鱼。
+- **文件下载**：聊天里保存图片/文件（FluffyChat Web = blob URL + `<a download>`）由 `on_download`
+  统一接管——保存到系统“下载”目录，同名自动追加序号（`photo (1).png`），完成后自动在文件管理器中
+  定位该文件（Windows 资源管理器选中态 / macOS `open -R` / Linux `xdg-open`）。主窗口与弹窗均生效。
 - **系统托盘**：关闭窗口隐藏到托盘；左键唤回，右键菜单「打开 / 退出」。
 - **单实例**：`tauri-plugin-single-instance`，二次启动唤醒已有窗口。
 - **离线验证**（main 分支已用 Playwright 拦截外部请求实测）：Flutter app 完整启动
