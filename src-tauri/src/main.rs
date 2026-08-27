@@ -226,15 +226,61 @@ fn setup_main_window(app: &tauri::App) -> tauri::Result<()> {
     let handle = app.handle().clone();
     let url: tauri::Url = "fc://localhost/".parse().expect("valid fc url");
 
-    WebviewWindowBuilder::new(app, "main", WebviewUrl::External(url))
+    // 登录会话/E2EE 密钥/消息缓存都在 WebView 用户数据目录 (UDF, 见 resolve_data_dir);
+    // 弹窗窗口必须与主窗口用同一 UDF (同一浏览器进程, 共享存储)。
+    let data_dir = resolve_data_dir(app);
+    let popup_data_dir = data_dir.clone();
+
+    let mut builder = WebviewWindowBuilder::new(app, "main", WebviewUrl::External(url))
         .title("FluffyChat")
         .inner_size(480.0, 820.0)
         .min_inner_size(360.0, 600.0)
         .center()
         .on_download(make_download_handler())
-        .on_new_window(move |url, features| open_web_popup(&handle, &url, features))
-        .build()?;
+        .on_new_window(move |url, features| {
+            open_web_popup(&handle, &url, features, popup_data_dir.clone())
+        });
+
+    if let Some(dir) = data_dir {
+        builder = builder.data_directory(dir);
+    }
+
+    builder.build()?;
     Ok(())
+}
+
+/// 解析 WebView 用户数据目录 (UDF):
+///
+/// - None: exe 所在目录可写 → 用 WebView2 默认 UDF (exe 旁 `<exe名>.exe.WebView2`),
+///   便携语义, 原地替换 exe 不丢登录/E2EE 数据 (现有用户数据保持原位, 无需迁移);
+/// - Some: exe 目录不可写 (如被放进 Program Files) → 回退到
+///   %LOCALAPPDATA%/<identifier>, 否则 WebView2 会因无法创建 UDF (Access Denied) 启动失败。
+///
+/// 仅 Windows 需要: WebKitGTK 默认写用户 XDG 目录, WKWebView 不使用该配置。
+fn resolve_data_dir(app: &tauri::App) -> Option<PathBuf> {
+    #[cfg(target_os = "windows")]
+    {
+        let exe_dir = std::env::current_exe().ok()?.parent()?.to_path_buf();
+        // 探测写权限: 创建后删除临时探测文件
+        let probe = exe_dir.join(format!(".fc-probe-{}", std::process::id()));
+        let writable = match std::fs::File::create(&probe) {
+            Ok(_) => {
+                let _ = std::fs::remove_file(&probe);
+                true
+            }
+            Err(_) => false,
+        };
+        if writable {
+            None
+        } else {
+            app.path().app_local_data_dir().ok()
+        }
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        let _ = app;
+        None
+    }
 }
 
 /// window.open 的通用子窗口: SSO/OIDC 登录、聊天中的外部链接、文件预览等,
@@ -248,6 +294,7 @@ fn open_web_popup(
     handle: &tauri::AppHandle,
     url: &tauri::Url,
     features: NewWindowFeatures,
+    data_dir: Option<PathBuf>,
 ) -> NewWindowResponse<tauri::Wry> {
     let label = format!(
         "web-popup-{}",
@@ -278,6 +325,13 @@ fn open_web_popup(
     })
     // 弹窗里的网页同样可能触发下载 (如页面上的文件链接)
     .on_download(make_download_handler());
+
+    // 与主窗口共用同一 UDF: 共享存储/cookie, 且 exe 目录不可写时弹窗才能创建成功
+    let builder = if let Some(dir) = data_dir {
+        builder.data_directory(dir)
+    } else {
+        builder
+    };
 
     match builder.build() {
         Ok(window) => NewWindowResponse::Create { window },

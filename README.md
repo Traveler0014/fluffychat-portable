@@ -84,14 +84,36 @@ cd src-tauri && cargo tauri build
 
 > `build/web_offline/`、`src-tauri/icons/`、`src-tauri/target/` 均为生成物，不纳入版本控制。
 
+## 数据存储与升级（登录 / E2EE / 消息缓存）
+
+登录会话、olm/megolm E2EE 密钥、消息数据库全部由 FluffyChat Web 写入 WebView 的
+IndexedDB / localStorage（无独立文件），落在 WebView **用户数据目录（UDF）**：
+
+| 运行方式 | 数据位置 |
+|---|---|
+| 便携 exe（目录可写，最常见） | exe 同目录下 `fluffychat-portable.exe.WebView2\`（WebView2 默认 UDF，数据跟着 exe 走） |
+| exe 在只读目录（如 Program Files） | 自动回退 `%LOCALAPPDATA%\im.fluffychat.portable\`（否则 WebView2 会创建 UDF 失败无法启动） |
+| 安装器版（NSIS/MSI） | 安装目录（`%LOCALAPPDATA%\Programs\FluffyChat Portable\`）下的同名 UDF |
+| Linux | `~/.local/share/` 下（WebKitGTK 默认） |
+
+**升级是否丢数据：**
+
+- ✅ 便携 exe **原地覆盖**（同一目录替换旧 exe）：不丢
+- ✅ 安装器**升级安装**：不丢（UDF 在安装目录，升级只替换程序文件）
+- ⚠️ 新 exe **放到别的目录运行**：相当于全新 profile（旧数据仍在旧目录旁，把整个目录连同
+  `fluffychat-portable.exe.WebView2\` 一起搬移即可找回）
+- ❌ **卸载安装器版**：安装目录连同 UDF 一起删除，登录与 E2EE 密钥丢失——卸载前请先在
+  FluffyChat 设置中导出加密备份
+- 换机器：同上，走加密备份恢复
+
 ## 注意事项
 
 - **Matrix 通信仍需联网**：本方案只解决"界面加载慢"；消息收发走你所选的 homeserver。
   建议配合国内自建/公共服务器（`-homeserver` 预设），否则收发仍慢。
 - **WebView2 依赖**：Win10/11 普遍内置；极老/精简系统需先装一次 WebView2 Runtime（微软官方）。
 - **字体**：离线时 UI 使用系统字体（中文 = 微软雅黑），观感略有差异。
-- **E2EE 数据**：登录会话/密钥/消息缓存放 WebView 本地存储（用户数据目录）；换机器需走
-  FluffyChat 加密备份恢复。
+- **E2EE 数据**：见上文「数据存储与升级」——登录会话/密钥/消息缓存在 WebView UDF 中，
+  便携原地覆盖升级不丢；卸载安装器版会删除，请先导出加密备份。
 - **更新**：上游发新版本时重跑 `./prepare.sh <新版本>` + 重新构建即可。
 
 ## 许可证
