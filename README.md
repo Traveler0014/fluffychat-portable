@@ -53,6 +53,15 @@ fluffychat-portable.exe -preset "server1.example,server2.example"
   关系并导航到鉴权页，完成后 `auth.html` 经 `postMessage` 回传 loginToken，支持 Mozilla 等 SSO 服务器。
   该弹窗是通用的（聊天外链、文件预览等同样走这里）：标题跟随页面真实 `document.title`
   （导航中显示目标域名），不再写死为“登录”，SSO 输入凭据时也能看清当前站点，防钓鱼。
+- **内部浏览器弹窗**：聊天里的链接/SSO/文件预览统一在内部弹窗打开（共享 WebView 存储）。
+  弹窗补齐了“地址可获取、可转交系统浏览器”的能力（信令通道 `fc://__shell/*`）：
+  - **Ctrl+L**：复制当前页地址（toast 同时展示完整地址，复制失败也能获取）；
+  - **Ctrl+Shift+O**：当前页转交系统默认浏览器打开；
+  - 菜单栏「页面(P)」：复制地址 / 在系统浏览器打开 / 后退（Alt+←）/ 前进（Alt+→）/ 刷新（Ctrl+R）
+    （后三个快捷键为 WebView2 原生 accelerator）；
+  - 弹窗内 `target=_blank` 二级链接可继续点击打开（递归弹窗）。
+- **主窗口 Ctrl+左键**：按住 Ctrl 点击聊天链接，直接用系统浏览器打开（绕过内部弹窗）；
+  SSO 登录链接始终走内部弹窗，保证登录回跳流程不被打断。
 - **文件下载**：聊天里保存图片/文件（FluffyChat Web = blob URL + `<a download>`）由 `on_download`
   统一接管——保存到系统“下载”目录，同名自动追加序号（`photo (1).png`），完成后自动在文件管理器中
   定位该文件（Windows 资源管理器选中态 / macOS `open -R` / Linux `xdg-open`）。主窗口与弹窗均生效。

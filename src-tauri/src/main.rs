@@ -4,6 +4,9 @@
 //   - 本机 WebView2/WebKitGTK 渲染, 独立窗口 + 系统托盘 + 单实例
 //   - 前端资源经自定义协议 fc:// 提供 (等价于 Go 版的 HTTP server)
 //   - 动态 config.json (等价 Go 版 -homeserver/-preset 参数)
+//   - 弹窗 (内部浏览器) 能力补齐: 菜单栏 + Ctrl+L 取地址 + Ctrl+Shift+O 转系统
+//     浏览器 + 弹窗内二级链接可打开; 主窗口 Ctrl+左键直接系统浏览器打开链接
+//     (信令通道 __shell/*, 见 handle_shell_route)
 //
 // 用法:
 //   fluffychat-portable                     # 默认 homeserver = matrix.org
@@ -51,7 +54,7 @@ fn main() {
                 let _ = w.set_focus();
             }
         }))
-        .register_uri_scheme_protocol("fc", |ctx, req| handle_protocol(ctx, req))
+        .register_uri_scheme_protocol("fc", handle_protocol)
         .setup(|app| {
             setup_main_window(app)?;
             setup_tray(app)?;
@@ -263,6 +266,8 @@ fn setup_main_window(app: &tauri::App) -> tauri::Result<()> {
         .inner_size(480.0, 820.0)
         .min_inner_size(360.0, 600.0)
         .center()
+        // Ctrl+左键聊天链接 → 直接系统浏览器打开 (见 MAIN_INIT_JS)
+        .initialization_script(MAIN_INIT_JS)
         .on_download(make_download_handler())
         .on_new_window(move |url, features| {
             open_web_popup(&handle, &url, features, popup_data_dir.clone())
@@ -544,6 +549,7 @@ fn reveal_in_file_manager(path: &Path) {
 /// 弹窗初始化脚本: 注入到每个 web-popup 窗口的每一页面。
 /// - Ctrl+L: 复制当前页地址 (失败也以 toast 展示完整地址, 保证地址总是可获取)
 /// - Ctrl+Shift+O: 当前页转交系统浏览器打开
+///
 /// 其余导航键 (Alt+←/→、Ctrl+R/F5) 交给 WebView2 原生 accelerator, 不在 JS 重复处理
 /// (避免与原生行为叠加双次后退/刷新)。
 const POPUP_INIT_JS: &str = r#"(function () {
@@ -687,7 +693,7 @@ const SHELL_CLOSING_PAGE: &str = r#"<!doctype html>
 /// __shell/* 信令路由 (匹配则返回 Some):
 /// - __shell/open?url=… : 转交系统浏览器打开, 返回确认页
 ///   (弹窗: 顶层导航到达, 页面被替换为确认页本身就是操作反馈;
-///    主窗口: fetch 调用, 确认页仅作为响应体不会被展示)
+///   主窗口: fetch 调用, 确认页仅作为响应体不会被展示)
 /// - __shell/close : 关闭发起请求的 webview 窗口
 fn handle_shell_route<R: Runtime>(
     ctx: &UriSchemeContext<'_, R>,
@@ -735,6 +741,44 @@ fn handle_shell_route<R: Runtime>(
         _ => None,
     }
 }
+
+/// 主窗口初始化脚本 (仅主窗口, 不注入弹窗):
+/// 按住 Ctrl 点聊天链接 → 直接用系统浏览器打开 (绕过内部弹窗)。
+///
+/// 实现: 在 pointerdown 瞬间快照修饰键 (capture 阶段, 先于 Flutter 手势竞技场,
+/// 无竞态), window.open 时消费快照 —— 从物理点击到 url_launcher 调 window.open
+/// 间有异步延迟, 届时同步事件早已不可读; 读即清避免残留影响后续键盘激活。
+///
+/// - 返回 null 无副作用: url_launcher 的 web 实现不检查 window.open 返回值
+/// - 信令用相对路径 fetch (主窗口 origin 即 fc://localhost, 恒同源; Windows 上
+///   实为 http://fc.localhost); 失败退化为 Image 像素信标 (不依赖 CORS)
+/// - SSO 登录链接 (/_matrix/.../login/sso) 豁免: 转外部浏览器会断登录回跳
+const MAIN_INIT_JS: &str = r#"(function () {
+  var forceExternal = false;
+  function snap(e) { forceExternal = !!(e.ctrlKey || e.metaKey); }
+  window.addEventListener('pointerdown', snap, true);
+  window.addEventListener('mousedown', snap, true);
+
+  var SSO = /\/_matrix\/.*\/login\/sso/;
+  var origOpen = window.open.bind(window);
+  window.open = function (url, target, features) {
+    var u = String(url || '');
+    if (forceExternal && /^https?:/i.test(u) && !SSO.test(u)) {
+      forceExternal = false;
+      var signal = '/__shell/open?url=' + encodeURIComponent(u);
+      try {
+        fetch(signal, { cache: 'no-store' }).catch(function () {
+          var i = new Image(); i.src = signal;
+        });
+      } catch (e) {
+        var i = new Image(); i.src = signal;
+      }
+      return null;
+    }
+    return origOpen(url, target, features);
+  };
+})();
+"#;
 
 /// 弹窗初始化脚本实例化: 按平台替换信令地址前缀
 fn popup_init_script() -> String {
