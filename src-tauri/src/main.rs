@@ -20,7 +20,7 @@ use std::sync::OnceLock;
 
 use rust_embed::RustEmbed;
 use tauri::http::{header, Request, Response, StatusCode};
-use tauri::menu::{Menu, MenuItem};
+use tauri::menu::{Menu, MenuItem, PredefinedMenuItem, Submenu};
 use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
 use tauri::webview::{DownloadEvent, NewWindowResponse, NewWindowFeatures, PageLoadEvent};
 use tauri::{Manager, Runtime, UriSchemeContext, WebviewUrl, WebviewWindowBuilder, WindowEvent};
@@ -65,6 +65,25 @@ fn main() {
                     let _ = window.hide();
                 }
             }
+        })
+        .on_menu_event(|app, event| {
+            // 窗口菜单 (web-popup) 事件: id 形如 "<label>::<action>" (见 popup_menu);
+            // 托盘菜单 id (open/quit) 不含 "::", 走 setup_tray 自己的回调
+            let Some((label, action)) = event.id.as_ref().split_once("::") else {
+                return;
+            };
+            let Some(w) = app.get_webview_window(label) else {
+                return;
+            };
+            let js = match action {
+                "copy-url" => "window.__fcCopyUrl && __fcCopyUrl()",
+                "open-external" => "window.__fcOpenExt && __fcOpenExt()",
+                "back" => "history.back()",
+                "forward" => "history.forward()",
+                "reload" => "location.reload()",
+                _ => return,
+            };
+            let _ = w.eval(js);
         })
         .run(tauri::generate_context!())
         .expect("error while running FluffyChat Portable");
@@ -310,7 +329,10 @@ fn open_web_popup(
     );
     let initial_title = host_of(url).unwrap_or_else(|| "FluffyChat".into());
 
-    let builder = WebviewWindowBuilder::new(
+    // 原生菜单栏 (页面: 复制地址/外部打开/导航); 失败不阻塞弹窗本身
+    let menu = popup_menu(handle, &label).ok();
+
+    let mut builder = WebviewWindowBuilder::new(
         handle,
         &label,
         WebviewUrl::External("about:blank".parse().unwrap()),
@@ -336,12 +358,23 @@ fn open_web_popup(
     // 弹窗里的网页同样可能触发下载 (如页面上的文件链接)
     .on_download(make_download_handler());
 
+    if let Some(menu) = menu {
+        builder = builder.menu(menu);
+    }
+
     // 与主窗口共用同一 UDF: 共享存储/cookie, 且 exe 目录不可写时弹窗才能创建成功
-    let builder = if let Some(dir) = data_dir {
+    let builder = if let Some(dir) = data_dir.clone() {
         builder.data_directory(dir)
     } else {
         builder
     };
+
+    // 弹窗内的 target=_blank 二级链接: wry 对未挂 on_new_window 的 webview 一律
+    // Deny (表现为点击无反应), 这里递归开新弹窗 (label 计数器保证唯一)
+    let popup_handle = handle.clone();
+    let builder = builder.on_new_window(move |url, features| {
+        open_web_popup(&popup_handle, &url, features, data_dir.clone())
+    });
 
     match builder.build() {
         Ok(window) => NewWindowResponse::Create { window },
@@ -353,6 +386,29 @@ fn host_of(url: &tauri::Url) -> Option<String> {
     url.host_str()
         .map(str::to_string)
         .filter(|host| !host.is_empty())
+}
+
+/// 弹窗的原生菜单栏: 给"地址可获取/可外部打开"提供可发现的鼠标入口。
+/// 菜单项 id 编码 "<窗口label>::<action>", 全局 on_menu_event 按此路由回对应弹窗
+/// (MenuEvent 不携带窗口信息); 动作全部 eval 到注入脚本/页面 API 上执行。
+///
+/// 菜单文字中的快捷键仅为提示, 不注册真 accelerator —— webview 聚焦时原生
+/// accelerator 不可靠, 且与注入 JS 双重处理会触发两次; 键盘路径由 POPUP_INIT_JS
+/// 接管。Alt+←/→、Ctrl+R/F5 为 WebView2 原生 accelerator, 亦无需处理。
+fn popup_menu(handle: &tauri::AppHandle, label: &str) -> tauri::Result<Menu<tauri::Wry>> {
+    let item = |action: &str, text: &str| {
+        MenuItem::with_id(handle, format!("{label}::{action}"), text, true, None::<&str>)
+    };
+    let copy = item("copy-url", "复制页面地址\tCtrl+L")?;
+    let open_ext = item("open-external", "在系统浏览器打开\tCtrl+Shift+O")?;
+    let sep = PredefinedMenuItem::separator(handle)?;
+    let back = item("back", "后退\tAlt+←")?;
+    let forward = item("forward", "前进\tAlt+→")?;
+    let reload = item("reload", "重新加载\tCtrl+R")?;
+
+    let page = Submenu::with_id(handle, "page", "页面(&P)", true)?;
+    page.append_items(&[&copy, &open_ext, &sep, &back, &forward, &reload])?;
+    Menu::with_items(handle, &[&page])
 }
 
 /// 文件下载处理 (on_download), 主窗口与弹窗共用。
