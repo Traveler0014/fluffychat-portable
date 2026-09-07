@@ -23,7 +23,7 @@ use tauri::http::{header, Request, Response, StatusCode};
 use tauri::menu::{Menu, MenuItem};
 use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
 use tauri::webview::{DownloadEvent, NewWindowResponse, NewWindowFeatures, PageLoadEvent};
-use tauri::{Manager, WebviewUrl, WebviewWindowBuilder, WindowEvent};
+use tauri::{Manager, Runtime, UriSchemeContext, WebviewUrl, WebviewWindowBuilder, WindowEvent};
 
 /// 裁剪后的 FluffyChat Web 静态资源 (由 prepare.sh 生成到 build/web_offline/)
 /// 注意: 相对路径基于 $CARGO_MANIFEST_DIR = src-tauri/
@@ -51,7 +51,7 @@ fn main() {
                 let _ = w.set_focus();
             }
         }))
-        .register_uri_scheme_protocol("fc", |_ctx, req| handle_protocol(req))
+        .register_uri_scheme_protocol("fc", |ctx, req| handle_protocol(ctx, req))
         .setup(|app| {
             setup_main_window(app)?;
             setup_tray(app)?;
@@ -158,10 +158,18 @@ fn render_config(homeserver: Option<&str>, preset: Option<&str>) -> String {
     serde_json::to_string_pretty(&cfg).unwrap_or_else(|_| "{}".into())
 }
 
-/// fc:// 自定义协议处理器: 动态 config.json + 嵌入静态资源
-fn handle_protocol(request: Request<Vec<u8>>) -> Response<Vec<u8>> {
+/// fc:// 自定义协议处理器: 动态 config.json + 嵌入静态资源 + __shell/* 信令路由
+fn handle_protocol<R: Runtime>(
+    ctx: UriSchemeContext<'_, R>,
+    request: Request<Vec<u8>>,
+) -> Response<Vec<u8>> {
     let path = request.uri().path().trim_start_matches('/');
     let path = if path.is_empty() { "index.html" } else { path };
+
+    // __shell/*: 页面 JS → 壳的原生命令通道 (见 handle_shell_route)
+    if let Some(resp) = handle_shell_route(&ctx, path, &request) {
+        return resp;
+    }
 
     if path == "config.json" {
         let body = CONFIG_JSON
@@ -314,6 +322,8 @@ fn open_web_popup(
     .on_document_title_changed(|window, title| {
         let _ = window.set_title(&title);
     })
+    // 弹窗内页面能力补齐: Ctrl+L 复制/查看地址, Ctrl+Shift+O 转系统浏览器 (见 POPUP_INIT_JS)
+    .initialization_script(popup_init_script())
     // 导航开始时先显示目标域名: 多跳转的 OIDC 流程中, 避免新页面加载完成前
     // 窗口仍停留在上一跳的标题
     .on_page_load(|window, payload| {
@@ -464,6 +474,321 @@ fn reveal_in_file_manager(path: &Path) {
     {
         let _ = path;
     }
+}
+
+// ---------------------------------------------------------------------------
+// __shell/* 信令通道: 页面 JS → 壳的原生能力 (复制地址/外部打开/关窗)
+//
+// 弹窗加载的是第三方 https 页面, 向 fc:// (Windows 上实为 http://fc.localhost) 发
+// fetch 属 mixed content 会被拦, 唯一可靠通道是顶层导航 (location.href); 主窗口
+// (自家 origin) 则直接用相对路径 fetch。__shell/open 的 url 参数仅白名单 http/https,
+// 防止恶意页面借壳触发任意系统协议处理器 (ms-msdt:/file: 等)。
+// ---------------------------------------------------------------------------
+
+/// 弹窗初始化脚本: 注入到每个 web-popup 窗口的每一页面。
+/// - Ctrl+L: 复制当前页地址 (失败也以 toast 展示完整地址, 保证地址总是可获取)
+/// - Ctrl+Shift+O: 当前页转交系统浏览器打开
+/// 其余导航键 (Alt+←/→、Ctrl+R/F5) 交给 WebView2 原生 accelerator, 不在 JS 重复处理
+/// (避免与原生行为叠加双次后退/刷新)。
+const POPUP_INIT_JS: &str = r#"(function () {
+  var SHELL = '__SHELL_BASE__';
+
+  function toast(msg) {
+    try {
+      var d = document.createElement('div');
+      d.textContent = msg;
+      var s = d.style;
+      s.position = 'fixed'; s.left = '50%'; s.bottom = '24px';
+      s.transform = 'translateX(-50%)'; s.maxWidth = '80vw';
+      s.overflowWrap = 'anywhere'; s.background = 'rgba(0,0,0,.78)';
+      s.color = '#fff'; s.font = '13px/1.6 system-ui,sans-serif';
+      s.padding = '6px 14px'; s.borderRadius = '6px'; s.zIndex = '2147483647';
+      (document.body || document.documentElement).appendChild(d);
+      setTimeout(function () { d.remove(); }, 4000);
+    } catch (e) {}
+  }
+
+  function copyText(text) {
+    var p;
+    try {
+      // 非安全上下文 (http 第三方页) 下 navigator.clipboard 为 undefined, 走 catch
+      p = navigator.clipboard.writeText(text).then(function () { return true; }, function () { return false; });
+    } catch (e) {
+      p = Promise.resolve(false);
+    }
+    return p.then(function (ok) {
+      if (ok) return true;
+      try {
+        var t = document.createElement('textarea');
+        t.value = text;
+        t.style.position = 'fixed'; t.style.opacity = '0';
+        (document.body || document.documentElement).appendChild(t);
+        t.focus(); t.select();
+        ok = document.execCommand('copy');
+        t.remove();
+        return !!ok;
+      } catch (e) { return false; }
+    });
+  }
+
+  window.__fcCopyUrl = function () {
+    copyText(location.href).then(function (ok) {
+      toast(ok ? '地址已复制: ' + location.href : '复制失败, 当前地址: ' + location.href);
+    });
+  };
+
+  window.__fcOpenExt = function () {
+    location.href = SHELL + '/__shell/open?url=' + encodeURIComponent(location.href);
+  };
+
+  window.addEventListener('keydown', function (e) {
+    var k = (e.key || '').toLowerCase();
+    var mod = e.ctrlKey || e.metaKey;
+    if (mod && k === 'l') { e.preventDefault(); window.__fcCopyUrl(); }
+    else if (mod && e.shiftKey && k === 'o') { e.preventDefault(); window.__fcOpenExt(); }
+  }, true);
+})();
+"#;
+
+/// __shell/open 成功页: 明示已转交系统浏览器, 并把地址展示出来 (可选中复制)
+const SHELL_OPENED_PAGE: &str = r#"<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>已在系统浏览器打开</title>
+<style>
+  body { margin:0; min-height:100vh; display:flex; align-items:center; justify-content:center;
+         font:14px/1.7 system-ui,"Segoe UI","Microsoft YaHei",sans-serif;
+         background:#fafafa; color:#24292f; }
+  @media (prefers-color-scheme: dark) { body { background:#0d1117; color:#e6edf3; } }
+  .card { max-width:560px; margin:24px; padding:24px 28px; border:1px solid #d0d7de; border-radius:12px; }
+  .ok { font-size:15px; font-weight:600; }
+  .url { margin:14px 0 18px; padding:8px 12px; background:rgba(125,125,125,.12);
+         border-radius:6px; font:12px/1.6 ui-monospace,Consolas,monospace;
+         word-break:break-all; cursor:text; }
+  button { padding:6px 18px; font:13px system-ui; border:1px solid #d0d7de; border-radius:6px;
+           background:#f6f8fa; color:inherit; cursor:pointer; }
+  @media (prefers-color-scheme: dark) { button { background:#21262d; border-color:#30363d; } }
+</style>
+</head>
+<body>
+<div class="card">
+  <div class="ok">✓ 已在系统浏览器中打开</div>
+  <div class="url" id="u" title="点击全选">{URL}</div>
+  <button onclick="closeWin()">关闭本窗口</button>
+</div>
+<script>
+  var u = document.getElementById('u');
+  u.addEventListener('click', function () {
+    var r = document.createRange(); r.selectNodeContents(u);
+    var s = window.getSelection(); s.removeAllRanges(); s.addRange(r);
+  });
+  // 弹窗由 window.open 而来, window.close() 通常有效;
+  // 兼若仍存活则走信令由壳关闭 (非脚本打开的窗口 window.close 无效)
+  function closeWin() {
+    try { window.close(); } catch (e) {}
+    setTimeout(function () { location.href = '/__shell/close'; }, 150);
+  }
+</script>
+</body>
+</html>
+"#;
+
+/// __shell/open 失败页 (参数缺失/非 http(s) scheme)
+const SHELL_OPEN_FAILED_PAGE: &str = r#"<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>无法打开</title>
+<style>
+  body { margin:0; min-height:100vh; display:flex; align-items:center; justify-content:center;
+         font:14px/1.7 system-ui,"Segoe UI","Microsoft YaHei",sans-serif;
+         background:#fafafa; color:#24292f; }
+  @media (prefers-color-scheme: dark) { body { background:#0d1117; color:#e6edf3; } }
+  .card { max-width:560px; margin:24px; padding:24px 28px; border:1px solid #d0d7de; border-radius:12px; }
+  .url { margin-top:14px; padding:8px 12px; background:rgba(125,125,125,.12);
+         border-radius:6px; font:12px/1.6 ui-monospace,Consolas,monospace;
+         word-break:break-all; cursor:text; }
+</style>
+</head>
+<body>
+<div class="card">
+  <div>无法在外部打开该地址：仅支持 http/https 链接</div>
+  <div class="url">{URL}</div>
+</div>
+</body>
+</html>
+"#;
+
+/// __shell/close 应答页: 窗口即将关闭的过渡页 (顺带 window.close 双保险)
+const SHELL_CLOSING_PAGE: &str = r#"<!doctype html>
+<meta charset="utf-8">
+<title>关闭中…</title>
+<body style="font:13px system-ui">正在关闭窗口…</body>
+<script>try { window.close(); } catch (e) {}</script>
+"#;
+
+/// __shell/* 信令路由 (匹配则返回 Some):
+/// - __shell/open?url=… : 转交系统浏览器打开, 返回确认页
+///   (弹窗: 顶层导航到达, 页面被替换为确认页本身就是操作反馈;
+///    主窗口: fetch 调用, 确认页仅作为响应体不会被展示)
+/// - __shell/close : 关闭发起请求的 webview 窗口
+fn handle_shell_route<R: Runtime>(
+    ctx: &UriSchemeContext<'_, R>,
+    path: &str,
+    request: &Request<Vec<u8>>,
+) -> Option<Response<Vec<u8>>> {
+    match path {
+        "__shell/open" => {
+            let raw = query_param(request.uri().query().unwrap_or_default(), "url");
+            let target = raw
+                .as_deref()
+                .and_then(|s| tauri::Url::parse(s).ok())
+                .filter(|u| matches!(u.scheme(), "http" | "https"));
+            match target {
+                Some(u) => {
+                    open_in_system_browser(u.as_str());
+                    Some(respond(
+                        200,
+                        "text/html; charset=utf-8",
+                        shell_page(SHELL_OPENED_PAGE, u.as_str()).into_bytes(),
+                    ))
+                }
+                None => Some(respond(
+                    200,
+                    "text/html; charset=utf-8",
+                    shell_page(SHELL_OPEN_FAILED_PAGE, raw.as_deref().unwrap_or("(空)")).into_bytes(),
+                )),
+            }
+        }
+        "__shell/close" => {
+            let label = ctx.webview_label().to_string();
+            let app = ctx.app_handle().clone();
+            let app2 = app.clone();
+            let _ = app.run_on_main_thread(move || {
+                if let Some(w) = app2.get_webview_window(&label) {
+                    let _ = w.close();
+                }
+            });
+            Some(respond(
+                200,
+                "text/html; charset=utf-8",
+                SHELL_CLOSING_PAGE.as_bytes().to_vec(),
+            ))
+        }
+        _ => None,
+    }
+}
+
+/// 弹窗初始化脚本实例化: 按平台替换信令地址前缀
+fn popup_init_script() -> String {
+    POPUP_INIT_JS.replace("__SHELL_BASE__", shell_base())
+}
+
+/// fc:// 的真实访问前缀。
+/// WebView2 不支持真正的自定义 scheme, wry 用 http://{scheme}.localhost 的
+/// workaround 转发 (custom_protocol_workaround.rs); 弹窗 (第三方页面) 发信令
+/// 必须用平台对应的真实地址, 否则 Windows 上顶层导航到 fc:// 会被拒。
+/// 注: 不能开 useHttpsScheme —— origin 变 https 会丢存量 localStorage/IndexedDB。
+fn shell_base() -> &'static str {
+    if cfg!(target_os = "windows") {
+        "http://fc.localhost"
+    } else {
+        "fc://localhost"
+    }
+}
+
+/// 系统默认浏览器打开 URL (调用处已白名单 http/https)
+#[cfg(target_os = "windows")]
+fn open_in_system_browser(url: &str) {
+    // ShellExecuteW 走系统关联 (默认浏览器), 与 explorer.exe 拼参数不同,
+    // 对任意 URL 形态都可靠
+    #[link(name = "shell32")]
+    extern "system" {
+        fn ShellExecuteW(
+            hwnd: isize,
+            lpverb: *const u16,
+            lpfile: *const u16,
+            lpparameters: *const u16,
+            lpdirectory: *const u16,
+            nshow: i32,
+        ) -> isize;
+    }
+    let wide = |s: &str| s.encode_utf16().chain(std::iter::once(0)).collect::<Vec<u16>>();
+    let verb = wide("open");
+    let file = wide(url);
+    unsafe {
+        ShellExecuteW(0, verb.as_ptr(), file.as_ptr(), std::ptr::null(), std::ptr::null(), 1);
+    }
+}
+#[cfg(target_os = "linux")]
+fn open_in_system_browser(url: &str) {
+    let _ = std::process::Command::new("xdg-open").arg(url).spawn();
+}
+#[cfg(target_os = "macos")]
+fn open_in_system_browser(url: &str) {
+    let _ = std::process::Command::new("open").arg(url).spawn();
+}
+
+/// 把模板页的 {URL} 占位符替换为转义后的地址
+fn shell_page(tpl: &str, url: &str) -> String {
+    tpl.replace("{URL}", &html_escape(url))
+}
+
+fn html_escape(s: &str) -> String {
+    s.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&#34;")
+}
+
+/// 提取查询参数 (application/x-www-form-urlencoded 风格: '+' = 空格, %XX 解码)
+fn query_param(query: &str, key: &str) -> Option<String> {
+    let prefix = format!("{key}=");
+    query
+        .split('&')
+        .find_map(|p| p.strip_prefix(&prefix))
+        .map(percent_decode)
+}
+
+fn percent_decode(s: &str) -> String {
+    fn hex(b: u8) -> Option<u8> {
+        match b {
+            b'0'..=b'9' => Some(b - b'0'),
+            b'a'..=b'f' => Some(b - b'a' + 10),
+            b'A'..=b'F' => Some(b - b'A' + 10),
+            _ => None,
+        }
+    }
+    let bytes = s.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'%' => match (
+                bytes.get(i + 1).copied().and_then(hex),
+                bytes.get(i + 2).copied().and_then(hex),
+            ) {
+                (Some(hi), Some(lo)) => {
+                    out.push(hi * 16 + lo);
+                    i += 3;
+                }
+                _ => {
+                    out.push(b'%');
+                    i += 1;
+                }
+            },
+            b'+' => {
+                out.push(b' ');
+                i += 1;
+            }
+            c => {
+                out.push(c);
+                i += 1;
+            }
+        }
+    }
+    String::from_utf8_lossy(&out).into_owned()
 }
 
 /// 系统托盘: 左键唤醒窗口, 右键菜单 (显示/退出)
