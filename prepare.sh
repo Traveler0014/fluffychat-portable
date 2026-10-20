@@ -8,14 +8,32 @@ VERSION="${1:-v2.8.0}"
 TARBALL="fluffychat-web-${VERSION}.tar.gz"
 BASE="https://github.com/krille-chan/fluffychat/releases/download/${VERSION}/fluffychat-web.tar.gz"
 
-echo "[1/4] 下载 release web 包 (国内可用加速镜像, 失败时换 ghfast.top 前缀)..."
+echo "[1/4] 下载 release web 包 (带 -f 校验/重试, 失败时换镜像前缀)..."
+TMP="${TARBALL}.part"
 if [ ! -f "$TARBALL" ]; then
-  curl -L -o "$TARBALL" "$BASE" || curl -L -o "$TARBALL" "https://gh.ddlc.top/$BASE"
+  ok=0
+  for url in "$BASE" "https://ghfast.top/$BASE" "https://gh.ddlc.top/$BASE"; do
+    echo "  尝试: $url"
+    rm -f "$TMP"
+    # -f: HTTP 错误直接失败(否则 404/403 页面会被当成 tarball 缓存下来, 后续永远不重试)
+    # 下载后先 tar t 校验完整性, 通过才落到正式文件名
+    if curl -fL --retry 3 --retry-delay 2 --connect-timeout 20 -o "$TMP" "$url" \
+       && tar tzf "$TMP" >/dev/null 2>&1; then
+      mv "$TMP" "$TARBALL"
+      ok=1
+      break
+    fi
+    echo "  失败: $url" >&2
+  done
+  rm -f "$TMP"
+  [ "$ok" = 1 ] || { echo "[prepare.sh] FATAL: 所有下载源均失败 ($BASE)" >&2; exit 1; }
 fi
 
 echo "[2/4] 解压..."
 rm -rf build/web_offline && mkdir -p build/web_offline
 tar xzf "$TARBALL" -C build/web_offline --strip-components=2 build/web
+[ -f build/web_offline/version.json ] \
+  && echo "  web 包内嵌版本: $(cat build/web_offline/version.json)"
 
 cd build/web_offline
 echo "[3/4] 裁剪冗余文件..."

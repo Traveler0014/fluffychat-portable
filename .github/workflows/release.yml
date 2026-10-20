@@ -31,18 +31,28 @@ on:
 jobs:
   prepare:
     runs-on: ubuntu-latest
+    outputs:
+      # 上游 web 包内嵌 version.json 的版本号 / 是否与请求版本不一致 (见 Verify 步骤说明)
+      web_pkg_version: ${{ steps.verify.outputs.web_pkg_version }}
+      web_pkg_mismatch: ${{ steps.verify.outputs.web_pkg_mismatch }}
     steps:
       - uses: actions/checkout@v4
       - name: Install Pillow (图标生成)
         run: pip install pillow
       - name: Prepare web assets
         run: ./prepare.sh ${{ inputs.version }}
-      - name: Verify upstream version & sync build metadata
-        # 1) 校验实际下载的上游 web 包版本 (防镜像错误/陈旧产物)
-        # 2) 同步 tauri.conf.json / Cargo.toml 版本 —— 两者在仓库里是写死的基线版本,
+      - name: Verify upstream web asset & sync build metadata
+        id: verify
+        # 1) 资产完整性: 与 GitHub Releases 上该 tag 附带的 fluffychat-web.tar.gz 逐字节比对
+        #    (= 防镜像陈旧/截断产物; 这是唯一权威判据)
+        # 2) 版本元数据: 上游偶尔发布内嵌版本落后的 web 包 (v2.11.1 的资产里 version.json
+        #    仍是 2.11.0/build 3570), 旧逻辑直接硬失败 → 自动跟随任务每 6h 空转报错。
+        #    改为: 同 major.minor 仅告警并继续; 跨 minor 仍硬失败 (那才是镜像/参数错误)。
+        # 3) 同步 tauri.conf.json / Cargo.toml 版本 —— 两者在仓库里是写死的基线版本,
         #    不回写会导致 NSIS/MSI 文件名与 exe 属性停留在旧版本号 (如 v2.9.1 构建出 2.8.0 安装器)
         env:
           VERSION: ${{ inputs.version }}
+          GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
           # 版本号格式校验 (与 auto-upstream.yml 一致)
@@ -51,11 +61,37 @@ jobs:
           VER="${VERSION#v}"      # 去 v 前缀
           VER="${VER%%+*}"        # 去 +build 元数据 (不进安装器命名)
 
+          TARBALL="fluffychat-web-${VERSION}.tar.gz"
+          ACTUAL_SHA=$(sha256sum "$TARBALL" | cut -d' ' -f1)
+          AUTH=()
+          if [ -n "${GH_TOKEN:-}" ]; then AUTH=(-H "Authorization: Bearer ${GH_TOKEN}"); fi
+          EXPECTED=$(curl -fsSL ${AUTH[@]+"${AUTH[@]}"} \
+            -H 'Accept: application/vnd.github+json' \
+            "https://api.github.com/repos/krille-chan/fluffychat/releases/tags/${VERSION}" \
+            | jq -r '.assets[] | select(.name == "fluffychat-web.tar.gz") | .digest // empty')
+          if [ -n "$EXPECTED" ]; then
+            [ "sha256:$ACTUAL_SHA" = "$EXPECTED" ] \
+              || { echo "::error::web 包 digest 不匹配: 本地 sha256:$ACTUAL_SHA, 上游 $EXPECTED (镜像陈旧或下载损坏)"; exit 1; }
+            echo "资产完整性校验通过: 与上游 ${VERSION} 发布资产一致 (${EXPECTED:0:19}…)"
+          else
+            echo "::warning::上游未提供资产 digest, 跳过完整性校验 (仅剩版本元数据校验)"
+          fi
+
           ACTUAL=$(jq -r '.version' build/web_offline/version.json)
           BUILD_NO=$(jq -r '.build_number' build/web_offline/version.json)
-          [ "$ACTUAL" = "$VER" ] \
-            || { echo "::error::版本不匹配: 请求 $VER, 但 web 包实际为 $ACTUAL"; exit 1; }
-          echo "上游 web 包版本校验通过: $ACTUAL (build $BUILD_NO)"
+          if [ "$ACTUAL" = "$VER" ]; then
+            echo "上游 web 包版本校验通过: $ACTUAL (build $BUILD_NO)"
+          elif [ "${ACTUAL%.*}" = "${VER%.*}" ]; then
+            echo "::warning::上游 ${VERSION} 的 web 包内嵌版本仍是 $ACTUAL (build $BUILD_NO) —— 上游打包问题; 资产 digest 已一致, 继续构建, Release 说明将标注该情况"
+          else
+            echo "::error::版本不匹配: 请求 $VER, 但 web 包实际为 $ACTUAL"; exit 1
+          fi
+          MISMATCH=false
+          [ "$ACTUAL" = "$VER" ] || MISMATCH=true
+          {
+            echo "web_pkg_version=$ACTUAL"
+            echo "web_pkg_mismatch=$MISMATCH"
+          } >> "$GITHUB_OUTPUT"
 
           jq --arg v "$VER" '.version = $v' src-tauri/tauri.conf.json > src-tauri/.tauri.conf.tmp \
             && mv src-tauri/.tauri.conf.tmp src-tauri/tauri.conf.json
@@ -73,6 +109,10 @@ jobs:
   build-windows:
     needs: prepare
     runs-on: windows-latest
+    outputs:
+      # 透传给 release 作业 (needs 只暴露直接依赖的 outputs)
+      web_pkg_version: ${{ needs.prepare.outputs.web_pkg_version }}
+      web_pkg_mismatch: ${{ needs.prepare.outputs.web_pkg_mismatch }}
     steps:
       - uses: actions/checkout@v4
       - uses: actions/download-artifact@v4
@@ -131,6 +171,8 @@ jobs:
           files: dist/**
           body: |
             FluffyChat Web **${{ inputs.version }}** 的离线单二进制桌面封装 (Tauri 版)。
+
+            ${{ needs.build-windows.outputs.web_pkg_mismatch == 'true' && format('> ⚠️ 上游 {0} 的 `fluffychat-web.tar.gz` 内嵌 `version.json` 仍为 **{1}** (上游打包未更新版本号)。本包内嵌资源即该资产原文 (digest 已核验一致), 页面内部版本号显示 {1} 属正常现象。', inputs.version, needs.build-windows.outputs.web_pkg_version) || '' }}
 
             ## 文件
             - `fluffychat-portable.exe` — 便携单文件 (推荐, 双击即用, 无安装)
