@@ -20,6 +20,7 @@
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::OnceLock;
+use std::time::Duration;
 
 use rust_embed::RustEmbed;
 use tauri::http::{header, Request, Response, StatusCode};
@@ -39,6 +40,20 @@ static CONFIG_JSON: OnceLock<String> = OnceLock::new();
 
 /// 用于给 window.open 弹出的子窗口生成唯一 label
 static NEXT_WINDOW_ID: AtomicU64 = AtomicU64::new(1);
+
+/// 内部浏览器弹窗的 label 前缀 (见 open_web_popup)
+const POPUP_PREFIX: &str = "web-popup-";
+
+/// 同时存活的弹窗上限。防页面 (广告/跳转链) 无限开窗 —— 多层嵌套弹窗
+/// 很容易演化成“看不见也关不掉”的后台 webview, 也是用户遇到过的音频幽灵来源。
+const MAX_POPUPS: usize = 8;
+
+/// 弹窗销毁前的缓冲: 让 about:blank 真正开始装载, 旧文档 (音频/WS/定时器) 随之终止
+const POPUP_TEARDOWN_DELAY: Duration = Duration::from_millis(200);
+
+fn is_popup(label: &str) -> bool {
+    label.starts_with(POPUP_PREFIX)
+}
 
 fn main() {
     let (homeserver, preset) = parse_args();
@@ -61,11 +76,16 @@ fn main() {
             Ok(())
         })
         .on_window_event(|window, event| {
-            // 关闭主窗口 → 隐藏到托盘 (托盘常驻, 对齐 Go 版语义)
             if let WindowEvent::CloseRequested { api, .. } = event {
                 if window.label() == "main" {
+                    // 关闭主窗口 → 隐藏到托盘 (托盘常驻, 对齐 Go 版语义)
                     api.prevent_close();
                     let _ = window.hide();
+                } else if is_popup(window.label()) {
+                    // 关闭弹窗 → 显式两级回收 (先断文档, 再销毁窗口), 见 teardown_popup
+                    api.prevent_close();
+                    let app = window.app_handle().clone();
+                    teardown_popup(&app, window.label());
                 }
             }
         })
@@ -328,8 +348,22 @@ fn open_web_popup(
     features: NewWindowFeatures,
     data_dir: Option<PathBuf>,
 ) -> NewWindowResponse<tauri::Wry> {
+    // 弹窗数量上限: 超出后改交系统浏览器, 避免页面无限嵌套开窗导致无法追踪的
+    // 后台 webview (此时 Deny 会让 window.open 拿到 null, 与浏览器拦截语义一致)
+    let live_popups = handle
+        .webview_windows()
+        .keys()
+        .filter(|label| is_popup(label.as_str()))
+        .count();
+    if live_popups >= MAX_POPUPS {
+        if matches!(url.scheme(), "http" | "https") {
+            open_in_system_browser(url.as_str());
+        }
+        return NewWindowResponse::Deny;
+    }
+
     let label = format!(
-        "web-popup-{}",
+        "{POPUP_PREFIX}{}",
         NEXT_WINDOW_ID.fetch_add(1, Ordering::Relaxed)
     );
     let initial_title = host_of(url).unwrap_or_else(|| "FluffyChat".into());
@@ -391,6 +425,69 @@ fn host_of(url: &tauri::Url) -> Option<String> {
     url.host_str()
         .map(str::to_string)
         .filter(|host| !host.is_empty())
+}
+
+// ---------------------------------------------------------------------------
+// 弹窗生命周期回收
+//
+// 问题背景 (用户报告): 内部浏览器弹窗点叉关掉后, 后台似乎没回收 webview ——
+// 极端时就变成“看不见、也关不掉”的幽灵页面 (例如一次跳转后自动播放了媒体)。
+//
+// WebView2 的渲染进程是否退出, 取决于 CoreWebView2Controller.Close() 何时执行
+// (wry 在 webview 被 drop 时调用)。若窗口对象在某个环节被多持有一份引用, 或
+// Close() 被推迟到 GC, 旧文档就仍然活着: 媒体继续出声、WebSocket/定时器继续跑。
+//
+// 所以不再依赖“关窗口 = 自动回收”这一单一链路, 改成显式三步回收:
+//   1) navigate("about:blank") —— 用空文档替掉当前文档, 音频/视频/WS/定时器随
+//      文档一起终止。即使 controller 回收被拖到最后, 也不会再有任何声音;
+//   2) hide() —— 用户感知上就是已关闭 (不会出现点了叉还停留一小会儿的窗口);
+//   3) 延时 destroy() —— 绕过 CloseRequested 直接销毁窗口 (不会递归到本函数),
+//      让 runtime 从窗口表里移除 webview 并执行 controller.Close()。
+//
+// 如果 1/3 任一环节因平台原因失效, 页面已变空白且不可见, 托盘菜单
+// 「关闭所有弹窗」可再兜底一次。
+// ---------------------------------------------------------------------------
+
+fn about_blank() -> tauri::Url {
+    "about:blank".parse().expect("valid about:blank url")
+}
+
+/// 回收单个弹窗 (见上方说明)。可从任意线程调用: Tauri 的窗口操作都是消息式派发。
+fn teardown_popup(app: &tauri::AppHandle, label: &str) {
+    let Some(win) = app.get_webview_window(label) else {
+        return;
+    };
+    let _ = win.navigate(about_blank());
+    let _ = win.hide();
+
+    let app = app.clone();
+    let label = label.to_string();
+    std::thread::spawn(move || {
+        std::thread::sleep(POPUP_TEARDOWN_DELAY);
+        // 重试几轮: destroy 是消息式派发, 窗口表移除有延迟; 且 label 由原子计数器
+        // 生成永不复用 —— 重试绝不会误伤后来新建的弹窗
+        for _ in 0..3 {
+            let Some(win) = app.get_webview_window(&label) else {
+                return;
+            };
+            // destroy 不触发 CloseRequested → 不会与上面的 prevent_close 形成回环
+            let _ = win.destroy();
+            std::thread::sleep(Duration::from_millis(120));
+        }
+    });
+}
+
+/// 关闭所有残留弹窗 (托盘菜单入口; 也是“后台幽灵 webview”的人工兜底)
+fn close_all_popups(app: &tauri::AppHandle) {
+    let labels: Vec<String> = app
+        .webview_windows()
+        .keys()
+        .filter(|label| is_popup(label.as_str()))
+        .cloned()
+        .collect();
+    for label in labels {
+        teardown_popup(app, &label);
+    }
 }
 
 /// 弹窗的原生菜单栏: 给"地址可获取/可外部打开"提供可发现的鼠标入口。
@@ -891,11 +988,16 @@ fn percent_decode(s: &str) -> String {
     String::from_utf8_lossy(&out).into_owned()
 }
 
-/// 系统托盘: 左键唤醒窗口, 右键菜单 (显示/退出)
+/// 系统托盘: 左键唤醒窗口, 右键菜单 (显示 / 关闭所有弹窗 / 退出)
 fn setup_tray(app: &tauri::App) -> tauri::Result<()> {
     let open = MenuItem::with_id(app, "open", "打开 FluffyChat", true, None::<&str>)?;
+    // 弹窗回收兜底入口: 弹窗是后开的独立窗口, 一旦躲到别的窗口后面/失去可见性,
+    // 用户没有别的入口能关掉它们 (主窗口的隐藏逻辑不影响弹窗)
+    let close_popups =
+        MenuItem::with_id(app, "close-popups", "关闭所有弹窗", true, None::<&str>)?;
+    let sep = PredefinedMenuItem::separator(app)?;
     let quit = MenuItem::with_id(app, "quit", "退出", true, None::<&str>)?;
-    let menu = Menu::with_items(app, &[&open, &quit])?;
+    let menu = Menu::with_items(app, &[&open, &close_popups, &sep, &quit])?;
 
     TrayIconBuilder::new()
         .icon(
@@ -913,7 +1015,17 @@ fn setup_tray(app: &tauri::App) -> tauri::Result<()> {
                     let _ = w.set_focus();
                 }
             }
-            "quit" => app.exit(0),
+            "close-popups" => close_all_popups(app),
+            "quit" => {
+                // 退出前先回收弹窗 (显式关闭 WebView2 controller), 再延时退出;
+                // 直接 exit 会让弹窗的 renderer 在进程收尾阶段被粗暴终止
+                close_all_popups(app);
+                let app = app.clone();
+                std::thread::spawn(move || {
+                    std::thread::sleep(POPUP_TEARDOWN_DELAY);
+                    app.exit(0);
+                });
+            }
             _ => {}
         })
         .on_tray_icon_event(|tray, event| {

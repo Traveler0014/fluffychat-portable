@@ -24,7 +24,7 @@ fluffychat-portable.exe -homeserver matrix.rumor.work
 fluffychat-portable.exe -preset "server1.example,server2.example"
 ```
 
-> 关闭窗口 = **隐藏到系统托盘**（不退出，聊天会话保持）。托盘图标：左键唤回窗口，右键菜单「打开 FluffyChat / 退出」。
+> 关闭窗口 = **隐藏到系统托盘**（不退出，聊天会话保持）。托盘图标：左键唤回窗口，右键菜单「打开 FluffyChat / 关闭所有弹窗 / 退出」。
 > 重复启动不会开第二个窗口，而是唤醒已有窗口（单实例）。
 
 ## 命令行参数
@@ -59,13 +59,18 @@ fluffychat-portable.exe -preset "server1.example,server2.example"
   - **Ctrl+Shift+O**：当前页转交系统默认浏览器打开；
   - 菜单栏「页面(P)」：复制地址 / 在系统浏览器打开 / 后退（Alt+←）/ 前进（Alt+→）/ 刷新（Ctrl+R）
     （后三个快捷键为 WebView2 原生 accelerator）；
-  - 弹窗内 `target=_blank` 二级链接可继续点击打开（递归弹窗）。
+  - 弹窗内 `target=_blank` 二级链接可继续点击打开（递归弹窗），同时存活的弹窗上限 8 个
+    （超出的链接改交系统浏览器，避免页面无限嵌套开窗留下无法追踪的后台 webview）。
+- **弹窗回收**：弹窗点叉不再只依赖“关窗 = 自动回收”（WebView2 的 `controller.Close()`
+  可能延迟执行，旧文档就会在后台继续播音频/跑 WebSocket）。改为显式两级回收：
+  先把文档导航到 `about:blank`（音频/定时器随文档终止），再延时 `destroy()` 销毁窗口
+  并释放 `controller`；托盘菜单「关闭所有弹窗」是可随时手动兜底。
+- **系统托盘**：关闭窗口隐藏到托盘；左键唤回，右键菜单「打开 / 关闭所有弹窗 / 退出」。
 - **主窗口 Ctrl+左键**：按住 Ctrl 点击聊天链接，直接用系统浏览器打开（绕过内部弹窗）；
   SSO 登录链接始终走内部弹窗，保证登录回跳流程不被打断。
 - **文件下载**：聊天里保存图片/文件（FluffyChat Web = blob URL + `<a download>`）由 `on_download`
   统一接管——保存到系统“下载”目录，同名自动追加序号（`photo (1).png`），完成后自动在文件管理器中
   定位该文件（Windows 资源管理器选中态 / macOS `open -R` / Linux `xdg-open`）。主窗口与弹窗均生效。
-- **系统托盘**：关闭窗口隐藏到托盘；左键唤回，右键菜单「打开 / 退出」。
 - **单实例**：`tauri-plugin-single-instance`，二次启动唤醒已有窗口。
 - **离线验证**（main 分支已用 Playwright 拦截外部请求实测）：Flutter app 完整启动
   （`#/home` 路由 + canvas 渲染 + vodozemac E2EE wasm 本地加载），唯一外部请求是
